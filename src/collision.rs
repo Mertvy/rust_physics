@@ -4,7 +4,12 @@ use crate::{
     world::RigidBodyMap,
 };
 use core::{f32, panic};
-use nalgebra::{Matrix3x2, SVD, UnitVector3, Vector3};
+use nalgebra::{UnitVector3, Vector3};
+use std::{
+    collections::HashMap,
+    f32::{INFINITY, consts::E},
+    hash::Hash,
+};
 
 const THRESHOLD: f32 = 1e-6;
 
@@ -190,44 +195,7 @@ fn gjk(
     }
 }
 
-fn construct_orthonormal_basis(v1: Vector3<f32>) -> [UnitVector3<f32>; 3] {
-    let v1 = UnitVector3::new_normalize(v1);
-    let v2 = if v1.x >= 0.57735 {
-        UnitVector3::new_normalize(Vector3::new(v1.y, -v1.x, 0.))
-    } else {
-        UnitVector3::new_normalize(Vector3::new(0., v1.z, -v1.y))
-    };
-    let v3 = UnitVector3::new_normalize(v1.cross(&v2));
-
-    return [v1, v2, v3];
-}
-
-fn expand_simplex(
-    simplex: &mut ArrayList<Vector3<f32>>,
-    collider1: &Collider,
-    collider2: &Collider,
-    rigid_bodies: &RigidBodyMap,
-) {
-    if simplex.len() == 2 {
-        let basis = construct_orthonormal_basis(simplex[0] - simplex[1]);
-        simplex.push(cso_support(collider1, collider2, &basis[1], rigid_bodies).0);
-        simplex.push(cso_support(collider1, collider2, &basis[2], rigid_bodies).0);
-    } else if simplex.len() == 3 {
-        let a = simplex[2];
-        let b = simplex[1];
-        let c = simplex[0];
-        let dir = UnitVector3::new_normalize((b - a).cross(&(c - a)));
-        simplex.push(cso_support(collider1, collider2, &dir, rigid_bodies).0);
-    }
-}
-
-struct Face {
-    vertices: [Vector3<f32>; 3],
-    normal: UnitVector3<f32>,
-    distance_from_origin: f32,
-}
-
-fn distance_origin_to_face(vertices: [Vector3<f32>; 3]) -> f32 {
+fn distance_origin_to_triangle(vertices: [Vector3<f32>; 3]) -> f32 {
     let [a, b, c] = vertices;
 
     let ab = b - a;
@@ -269,56 +237,127 @@ fn distance_origin_to_face(vertices: [Vector3<f32>; 3]) -> f32 {
     }
 }
 
-fn build_face(vertices: [Vector3<f32>; 3]) -> Face {
-    let [a, b, c] = vertices;
+fn construct_orthonormal_basis(v1: Vector3<f32>) -> [UnitVector3<f32>; 3] {
+    let v1 = UnitVector3::new_normalize(v1);
+    let v2 = if v1.x >= 0.57735 {
+        UnitVector3::new_normalize(Vector3::new(v1.y, -v1.x, 0.))
+    } else {
+        UnitVector3::new_normalize(Vector3::new(0., v1.z, -v1.y))
+    };
+    let v3 = UnitVector3::new_normalize(v1.cross(&v2));
 
-    let ab = b - a;
-    let ac = c - a;
-    let centroid = (a + b + c) / 3.;
-
-    let mut norm = UnitVector3::new_normalize(ab.cross(&ac));
-    if norm.dot(&centroid) < 0. {
-        norm = -norm;
-    }
-
-    let distance = norm.dot(&a);
-
-    return Face { vertices: vertices, normal: norm, distance_from_origin: distance };
+    return [v1, v2, v3];
 }
 
-fn build_initial_polytope(simplex: &ArrayList<Vector3<f32>>) -> ArrayList<Face> {
-    let a = simplex[3];
-    let b = simplex[2];
-    let c = simplex[1];
-    let d = simplex[0];
+fn expand_simplex(
+    simplex: &mut ArrayList<Vector3<f32>>,
+    collider1: &Collider,
+    collider2: &Collider,
+    rigid_bodies: &RigidBodyMap,
+) {
+    if simplex.len() == 2 {
+        let basis = construct_orthonormal_basis(simplex[0] - simplex[1]);
+        simplex.push(cso_support(collider1, collider2, &basis[1], rigid_bodies).0);
+        simplex.push(cso_support(collider1, collider2, &basis[2], rigid_bodies).0);
+    } else if simplex.len() == 3 {
+        let a = simplex[2];
+        let b = simplex[1];
+        let c = simplex[0];
+        let dir = UnitVector3::new_normalize((b - a).cross(&(c - a)));
+        simplex.push(cso_support(collider1, collider2, &dir, rigid_bodies).0);
+    }
+}
+
+struct Face {
+    vertex_ids: [usize; 3],
+    normal: UnitVector3<f32>,
+    distance_from_origin: f32,
+}
+
+impl Face {
+    fn build_face(vertex_ids: [usize; 3], vertex_map: &HashMap<usize, Vector3<f32>>) -> Face {
+        let [a_id, b_id, c_id] = vertex_ids;
+        let a = vertex_map.get(&a_id).expect("Vertex does not exist");
+        let b = vertex_map.get(&b_id).expect("Vertex does not exist");
+        let c = vertex_map.get(&c_id).expect("Vertex does not exist");
+
+        let ab = b - a;
+        let ac = c - a;
+        let centroid = (a + b + c) / 3.;
+
+        let mut norm = UnitVector3::new_normalize(ab.cross(&ac));
+        if norm.dot(&centroid) < 0. {
+            norm = -norm;
+        }
+
+        let distance = norm.dot(&a);
+
+        return Face { vertex_ids: vertex_ids, normal: norm, distance_from_origin: distance };
+    }
+}
+
+fn build_initial_polytope(
+    vertex_ids: [usize; 4],
+    vertex_map: &HashMap<usize, Vector3<f32>>,
+) -> ArrayList<Face> {
+    let [d_id, c_id, b_id, a_id] = vertex_ids;
 
     return ArrayList::from([
-        build_face([a, b, c]),
-        build_face([a, b, d]),
-        build_face([a, c, d]),
-        build_face([b, c, d]),
+        Face::build_face([a_id, b_id, c_id], vertex_map),
+        Face::build_face([a_id, b_id, d_id], vertex_map),
+        Face::build_face([a_id, c_id, d_id], vertex_map),
+        Face::build_face([b_id, c_id, d_id], vertex_map),
     ]);
 }
 
-fn update_polytope(faces: ArrayList<Face>, new_point: Vector3<f32>) -> ArrayList<Face> {
-    fn replace_face(face: &Face, new_point: Vector3<f32>) -> ArrayList<Face> {
-        let mut new_faces = ArrayList::new();
-        let [a, b, c] = face.vertices;
-        new_faces.push(build_face([a, b, new_point]));
-        new_faces.push(build_face([a, new_point, c]));
-        new_faces.push(build_face([new_point, b, c]));
+#[derive(Hash, PartialEq, std::cmp::Eq)]
+struct Edge(usize, usize);
 
-        return new_faces;
+impl Edge {
+    fn new(v1: usize, v2: usize) -> Edge {
+        return Edge(usize::min(v1, v2), usize::max(v1, v2));
     }
-    let mut new_faces: Vec<Face> = ArrayList::with_capacity(faces.len() * 3);
+}
+
+fn update_polytope(
+    faces: ArrayList<Face>,
+    new_vertex_id: usize,
+    vertex_map: &HashMap<usize, Vector3<f32>>,
+) -> ArrayList<Face> {
+    let mut new_faces = ArrayList::new();
+
+    let new_vertex = vertex_map.get(&new_vertex_id).expect("New point does not exist");
+    let mut visible_edges_count: HashMap<Edge, usize> = HashMap::new();
 
     for face in faces {
-        let visible = (new_point - face.vertices[0]).dot(&face.normal) > 1e-6;
+        let face_corner = vertex_map.get(&face.vertex_ids[0]).expect("Face vertex missing");
+        let visible = (new_vertex - face_corner).dot(&face.normal) > 1e-6;
+
         if visible {
-            new_faces.extend(replace_face(&face, new_point));
+            let edges = [
+                Edge::new(face.vertex_ids[0], face.vertex_ids[1]),
+                Edge::new(face.vertex_ids[0], face.vertex_ids[2]),
+                Edge::new(face.vertex_ids[1], face.vertex_ids[2]),
+            ];
+
+            for edge in edges {
+                *visible_edges_count.entry(edge).or_insert(0) += 1;
+            }
         } else {
             new_faces.push(face);
         }
+    }
+
+    let mut boundary_edges = ArrayList::new();
+    for (edge, count) in visible_edges_count {
+        if count == 1 {
+            boundary_edges.push(edge);
+        }
+    }
+
+    for edge in boundary_edges {
+        let new_face_vertex_ids = [edge.0, edge.1, new_vertex_id];
+        new_faces.push(Face::build_face(new_face_vertex_ids, vertex_map));
     }
 
     return new_faces;
@@ -331,20 +370,31 @@ fn expanding_polytope(
     rigid_bodies: &RigidBodyMap,
 ) -> (UnitVector3<f32>, f32) {
     expand_simplex(&mut simplex, collider1, collider2, rigid_bodies);
-    let mut faces = build_initial_polytope(&simplex);
-    let mut closest_face = faces.get(0).expect("Faces list is empty");
-    let mut min_distance = f32::INFINITY;
+
+    let mut vertex_map: HashMap<usize, Vector3<f32>> = HashMap::new();
+    for i in 0..4 {
+        vertex_map.insert(i, simplex[i]);
+    }
+    let mut new_vertex_id = 3;
+
+    let mut faces = build_initial_polytope([0, 1, 2, 3], &vertex_map);
+    let mut closest_face;
+
     loop {
-        for face in faces {
-            if face.distance_from_origin < min_distance {
-                min_distance = face.distance_from_origin;
-            }
-        }
-        let new_point = cso_support(collider1, collider2, &closest_face.normal, rigid_bodies).0;
-        if new_point.norm() - min_distance < 1e-6 {
+        closest_face = faces
+            .iter()
+            .min_by(|a, b| a.distance_from_origin.partial_cmp(&b.distance_from_origin).unwrap())
+            .unwrap();
+
+        let new_vertex = cso_support(collider1, collider2, &closest_face.normal, rigid_bodies).0;
+        new_vertex_id += 1;
+        vertex_map.insert(new_vertex_id, new_vertex);
+
+        let projected_distance = new_vertex.dot(&closest_face.normal);
+        if projected_distance - closest_face.distance_from_origin < 1e-6 {
             break;
         }
-        update_polytope(&mut faces, new_point);
+        faces = update_polytope(faces, new_vertex_id, &vertex_map);
     }
     return (closest_face.normal, closest_face.distance_from_origin);
 }
