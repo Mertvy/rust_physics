@@ -5,20 +5,20 @@ use na::{UnitVector3, Vector3};
 use std::usize;
 
 pub type ArrayList<T> = Vec<T>;
-pub struct ColliderPair(usize, usize);
+pub struct ColliderPair(pub usize, pub usize);
 
 pub trait BroadPhase {
     fn add(&mut self, aabb: AABB);
-    fn update(&mut self);
-    fn compute_pairs(&mut self);
+    fn update(&mut self, colliders: &ColliderMap);
+    fn query_potential_collisions(&self) -> ArrayList<ColliderPair>;
     fn query_point(&self, point: &Vector3<f32>) -> Option<usize>;
     fn query_aabb(&self, aabb: &AABB) -> ArrayList<usize>;
     fn query_ray(&self, ray: &Ray3, colliders: &ColliderMap) -> RayCastResult;
 }
 
 pub struct Ray3 {
-    pos: Vector3<f32>,
-    dir: UnitVector3<f32>,
+    pub pos: Vector3<f32>,
+    pub dir: UnitVector3<f32>,
 }
 
 pub struct RayCastResult {
@@ -29,8 +29,7 @@ pub struct RayCastResult {
 }
 
 pub struct NSquared {
-    aabb_list: ArrayList<AABB>,
-    collider_pair_list: ArrayList<ColliderPair>,
+    pub aabb_list: ArrayList<AABB>,
 }
 
 impl BroadPhase for NSquared {
@@ -38,21 +37,26 @@ impl BroadPhase for NSquared {
         self.aabb_list.push(aabb);
     }
 
-    fn update(&mut self) {}
+    fn update(&mut self, colliders: &ColliderMap) {
+        for aabb in &mut self.aabb_list {
+            let obb = &colliders.get(&aabb.collider_id).expect("AABB has not collider").obb;
+            aabb.update_from_obb(obb);
+        }
+    }
 
-    fn compute_pairs(&mut self) {
-        self.collider_pair_list.clear();
+    fn query_potential_collisions(&self) -> ArrayList<ColliderPair> {
+        let mut collider_pair_list = ArrayList::with_capacity(self.aabb_list.capacity() / 4);
         for i in 0..self.aabb_list.len() {
             for j in i + 1..self.aabb_list.len() {
                 let aabb1 = self.aabb_list.get(i).expect("AABB list out of whack");
                 let aabb2 = self.aabb_list.get(j).expect("AABB list out of whack");
 
                 if aabb1.collides(aabb2) {
-                    self.collider_pair_list
-                        .push(ColliderPair(aabb1.collider_id, aabb2.collider_id));
+                    collider_pair_list.push(ColliderPair(aabb1.collider_id, aabb2.collider_id));
                 }
             }
         }
+        return collider_pair_list;
     }
 
     fn query_point(&self, point: &Vector3<f32>) -> Option<usize> {

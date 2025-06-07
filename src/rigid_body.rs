@@ -1,6 +1,7 @@
 extern crate nalgebra as na;
 use crate::{
     broadphase::Ray3,
+    rigid_body,
     world::{ColliderMap, RigidBodyMap},
 };
 use core::f32;
@@ -111,27 +112,42 @@ impl RigidBody {
     }
 }
 
+enum ColliderShape {
+    Sphere { radius: f32 },
+    Box { x_len: f32, y_len: f32, z_len: f32 },
+}
+
 pub struct Collider {
     pub id: usize,
     pub body_id: usize,
+
+    pub obb: OBB,
+
+    pub shape: ColliderShape,
     pub mass: f32,
     local_inertia_tensor: Matrix3<f32>,
+
     local_center_mass: Vector3<f32>,
     local_orientation: UnitQuaternion<f32>,
 }
 
 impl Collider {
     pub fn support(&self, local_dir: &Vector3<f32>) -> Vector3<f32> {
-        todo!()
+        match &self.shape {
+            ColliderShape::Sphere { radius } => return *radius * local_dir.normalize(),
+            ColliderShape::Box { x_len, y_len, z_len } => {
+                return Vector3::new(
+                    if local_dir.x >= 0. { x_len / 2. } else { -x_len / 2. },
+                    if local_dir.y >= 0. { y_len / 2. } else { -y_len / 2. },
+                    if local_dir.z >= 0. { z_len / 2. } else { -z_len / 2. },
+                );
+            }
+        };
     }
 
     pub fn intersects_ray(&self, ray: &Ray3) -> (bool, f32, Vector3<f32>) {
         return (false, f32::INFINITY, Vector3::zeros());
     }
-}
-
-trait ColliderShape {
-    fn stuff() {}
 }
 
 fn is_overlapping(int1: (f32, f32), int2: (f32, f32)) -> bool {
@@ -147,7 +163,7 @@ pub struct OBB {
 }
 
 impl OBB {
-    pub fn new(collider_id: usize, colliders: &ColliderMap, rigid_bodies: &RigidBodyMap) -> OBB {
+    pub fn new(collider_id: usize, collider: &Collider, rigid_body: &RigidBody) -> OBB {
         let mut obb = OBB {
             collider_id: collider_id,
             local_min: Vector3::zeros(),
@@ -155,15 +171,11 @@ impl OBB {
             global_pos: Vector3::zeros(),
             global_orientation: UnitQuaternion::identity(),
         };
-        obb.update(colliders, rigid_bodies);
+        obb.update(collider, rigid_body);
         return obb;
     }
 
-    pub fn update(&mut self, colliders: &ColliderMap, rigid_bodies: &RigidBodyMap) {
-        let collider = colliders.get(&self.collider_id).expect("AABB does not belong to collider");
-        let rigid_body =
-            rigid_bodies.get(&collider.body_id).expect("Collider does not belong to rigid body");
-
+    pub fn update(&mut self, collider: &Collider, rigid_body: &RigidBody) {
         self.global_pos = rigid_body.local_to_global_pos(&collider.local_center_mass);
         self.global_orientation = collider.local_orientation * rigid_body.global_orientation;
     }
