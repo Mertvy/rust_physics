@@ -1,8 +1,9 @@
 extern crate nalgebra as na;
 use crate::{
-    broadphase::Ray3,
+    broadphase::{self, BroadPhase, NSquared, Ray3},
     rigid_body,
-    world::{ColliderMap, RigidBodyMap},
+    utils::safe_normalize,
+    world::{ColliderMap, OBBMap, RigidBodyMap},
 };
 use core::f32;
 use na::{Matrix3, UnitQuaternion, UnitVector3, Vector3};
@@ -28,20 +29,56 @@ pub struct RigidBody {
     torque_accumulator: Vector3<f32>,
 
     collider_id_list: ArrayList<usize>,
+
+    pub is_static: bool,
 }
 
 impl RigidBody {
+    pub fn new_body(
+        id: usize,
+        position: Vector3<f32>,
+        orientation: UnitQuaternion<f32>,
+        is_static: bool,
+    ) -> RigidBody {
+        return RigidBody {
+            id: id,
+            mass: 0.,
+            inv_mass: f32::INFINITY,
+            global_inv_moment_inertia: Matrix3::zeros(),
+            local_inv_moment_inertia: Matrix3::zeros(),
+
+            global_center_mass: position,
+            local_center_mass: Vector3::zeros(),
+
+            global_orientation: orientation,
+            lin_velocity: Vector3::zeros(),
+            ang_velocity: Vector3::zeros(),
+
+            force_accumulator: Vector3::zeros(),
+            torque_accumulator: Vector3::zeros(),
+
+            collider_id_list: ArrayList::new(),
+
+            is_static: is_static,
+        };
+    }
+
     pub fn update(&mut self, dt: f32) {
+        if self.is_static {
+            return;
+        }
+        self.lin_velocity *= 0.998;
         self.lin_velocity += (self.force_accumulator * self.inv_mass) * dt;
         self.force_accumulator = Vector3::zeros();
 
+        self.ang_velocity *= 0.998;
         self.ang_velocity += (self.global_inv_moment_inertia * self.torque_accumulator) * dt;
         self.torque_accumulator = Vector3::zeros();
 
         self.global_center_mass += self.lin_velocity * dt;
 
         if self.ang_velocity.norm() > 1e-6 {
-            let rot_axis = UnitVector3::new_normalize(self.ang_velocity);
+            let rot_axis = safe_normalize(self.ang_velocity);
             let rot_angle = self.ang_velocity.norm() * dt;
             let rot_operator = UnitQuaternion::from_axis_angle(&rot_axis, rot_angle);
             self.global_orientation = rot_operator * self.global_orientation;
@@ -53,7 +90,7 @@ impl RigidBody {
             rot_mat * self.local_inv_moment_inertia * rot_mat.transpose();
     }
 
-    fn add_collider(&mut self, collider_id: usize, colliders: &ColliderMap) {
+    pub fn add_collider(&mut self, collider_id: usize, colliders: &ColliderMap) {
         self.collider_id_list.push(collider_id);
 
         self.local_center_mass = Vector3::zeros();
@@ -112,7 +149,8 @@ impl RigidBody {
     }
 }
 
-enum ColliderShape {
+#[derive(Debug)]
+pub enum ColliderShape {
     Sphere { radius: f32 },
     Box { x_len: f32, y_len: f32, z_len: f32 },
 }
@@ -121,7 +159,7 @@ pub struct Collider {
     pub id: usize,
     pub body_id: usize,
 
-    pub obb: OBB,
+    pub obb_id: usize,
 
     pub shape: ColliderShape,
     pub mass: f32,
@@ -132,15 +170,54 @@ pub struct Collider {
 }
 
 impl Collider {
+    pub fn new_collider(
+        id: usize,
+        body_id: usize,
+        obb_id: usize,
+        shape: ColliderShape,
+        mass: f32,
+        local_center_mass: Vector3<f32>,
+        local_orientation: UnitQuaternion<f32>,
+    ) -> Collider {
+        let local_inertia_tensor = match shape {
+            ColliderShape::Sphere { radius } => {
+                (2. / 5.) * mass * radius * radius * Matrix3::identity()
+            }
+            ColliderShape::Box { x_len, y_len, z_len } => {
+                (1. / 12.)
+                    * mass
+                    * Matrix3::from_diagonal(&Vector3::new(
+                        y_len * y_len + z_len * z_len,
+                        x_len * x_len + z_len * z_len,
+                        x_len * x_len + y_len * y_len,
+                    ))
+            }
+        };
+
+        Collider {
+            id: id,
+            body_id: body_id,
+            obb_id: obb_id,
+            shape: shape,
+            mass: mass,
+            local_inertia_tensor: local_inertia_tensor,
+            local_center_mass: local_center_mass,
+            local_orientation: local_orientation,
+        }
+    }
+
     pub fn support(&self, local_dir: &Vector3<f32>) -> Vector3<f32> {
         match &self.shape {
-            ColliderShape::Sphere { radius } => return *radius * local_dir.normalize(),
+            ColliderShape::Sphere { radius } => {
+                return self.local_center_mass + *radius * local_dir.normalize();
+            }
             ColliderShape::Box { x_len, y_len, z_len } => {
-                return Vector3::new(
-                    if local_dir.x >= 0. { x_len / 2. } else { -x_len / 2. },
-                    if local_dir.y >= 0. { y_len / 2. } else { -y_len / 2. },
-                    if local_dir.z >= 0. { z_len / 2. } else { -z_len / 2. },
-                );
+                return self.local_center_mass
+                    + Vector3::new(
+                        if local_dir.x >= 0. { x_len / 2. } else { -x_len / 2. },
+                        if local_dir.y >= 0. { y_len / 2. } else { -y_len / 2. },
+                        if local_dir.z >= 0. { z_len / 2. } else { -z_len / 2. },
+                    );
             }
         };
     }
@@ -155,29 +232,50 @@ fn is_overlapping(int1: (f32, f32), int2: (f32, f32)) -> bool {
 }
 
 pub struct OBB {
+    pub id: usize,
     pub collider_id: usize,
-    local_min: Vector3<f32>,
-    local_max: Vector3<f32>,
-    global_pos: Vector3<f32>,
-    global_orientation: UnitQuaternion<f32>,
+    pub local_min: Vector3<f32>,
+    pub local_max: Vector3<f32>,
+    pub global_pos: Vector3<f32>,
+    pub global_orientation: UnitQuaternion<f32>,
 }
 
 impl OBB {
-    pub fn new(collider_id: usize, collider: &Collider, rigid_body: &RigidBody) -> OBB {
+    pub fn new(
+        id: usize,
+        collider_id: usize,
+        colliders: &ColliderMap,
+        rigid_bodies: &RigidBodyMap,
+    ) -> OBB {
         let mut obb = OBB {
+            id: id,
             collider_id: collider_id,
             local_min: Vector3::zeros(),
             local_max: Vector3::zeros(),
             global_pos: Vector3::zeros(),
             global_orientation: UnitQuaternion::identity(),
         };
-        obb.update(collider, rigid_body);
+        obb.update(colliders, rigid_bodies);
         return obb;
     }
 
-    pub fn update(&mut self, collider: &Collider, rigid_body: &RigidBody) {
+    pub fn update(&mut self, colliders: &ColliderMap, rigid_bodies: &RigidBodyMap) {
+        let collider = colliders.get(&self.collider_id).expect("OBB has no collider");
+        let rigid_body = rigid_bodies.get(&collider.body_id).expect("Collider has no body");
+
         self.global_pos = rigid_body.local_to_global_pos(&collider.local_center_mass);
         self.global_orientation = collider.local_orientation * rigid_body.global_orientation;
+
+        match &collider.shape {
+            ColliderShape::Box { x_len, y_len, z_len } => {
+                self.local_min = Vector3::new(-x_len / 2., -y_len / 2., -z_len / 2.);
+                self.local_max = Vector3::new(x_len / 2., y_len / 2., z_len / 2.);
+            }
+            ColliderShape::Sphere { radius } => {
+                self.local_min = Vector3::new(-radius, -radius, -radius);
+                self.local_max = Vector3::new(*radius, *radius, *radius);
+            }
+        }
     }
 
     pub fn contains(&self, point: &Vector3<f32>) -> bool {
@@ -274,6 +372,17 @@ pub struct AABB {
 }
 
 impl AABB {
+    pub fn new_from_obb(collider_id: usize, obb: &OBB) -> AABB {
+        let mut aabb = AABB {
+            collider_id: collider_id,
+            global_min: Vector3::zeros(),
+            global_max: Vector3::zeros(),
+        };
+        aabb.update_from_obb(obb);
+
+        return aabb;
+    }
+
     pub fn update_from_obb(&mut self, obb: &OBB) {
         let obb_vertices = obb.get_global_vertices();
 

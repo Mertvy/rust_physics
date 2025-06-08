@@ -1,5 +1,8 @@
 extern crate nalgebra as na;
-use crate::{rigid_body::AABB, world::ColliderMap};
+use crate::{
+    rigid_body::AABB,
+    world::{ColliderMap, OBBMap},
+};
 use core::f32;
 use na::{UnitVector3, Vector3};
 use std::usize;
@@ -9,7 +12,7 @@ pub struct ColliderPair(pub usize, pub usize);
 
 pub trait BroadPhase {
     fn add(&mut self, aabb: AABB);
-    fn update(&mut self, colliders: &ColliderMap);
+    fn update(&mut self, colliders: &ColliderMap, obbs: &OBBMap);
     fn query_potential_collisions(&self) -> ArrayList<ColliderPair>;
     fn query_point(&self, point: &Vector3<f32>) -> Option<usize>;
     fn query_aabb(&self, aabb: &AABB) -> ArrayList<usize>;
@@ -37,9 +40,11 @@ impl BroadPhase for NSquared {
         self.aabb_list.push(aabb);
     }
 
-    fn update(&mut self, colliders: &ColliderMap) {
+    fn update(&mut self, colliders: &ColliderMap, obbs: &OBBMap) {
         for aabb in &mut self.aabb_list {
-            let obb = &colliders.get(&aabb.collider_id).expect("AABB has not collider").obb;
+            let obb = obbs
+                .get(&colliders.get(&aabb.collider_id).expect("AABB has not collider").obb_id)
+                .expect("Collider has no OBB");
             aabb.update_from_obb(obb);
         }
     }
