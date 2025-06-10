@@ -479,6 +479,13 @@ fn compute_suface_collision_points(
     let w = (d00 * d21 - d01 * d20) / denom;
     let u = 1.0 - v - w;
 
+    if denom.abs() < 1e-8 {
+        // Degenerate triangle, return something safe or fallback
+        let avg1 = (a.support1 + b.support1 + c.support1) / 3.0;
+        let avg2 = (a.support2 + b.support2 + c.support2) / 3.0;
+        return (avg1, avg2);
+    }
+
     return (
         u * a.support1 + v * b.support1 + w * c.support1,
         u * a.support2 + v * b.support2 + w * c.support2,

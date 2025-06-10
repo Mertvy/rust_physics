@@ -5,7 +5,9 @@ use kiss3d::light::Light;
 use kiss3d::scene::SceneNode;
 use kiss3d::window::Window;
 
-use na::{Translation3, UnitQuaternion, Vector3};
+use rayon;
+
+use na::{Translation3, UnitQuaternion};
 use std::collections::HashMap;
 
 mod broadphase;
@@ -15,7 +17,7 @@ mod rigid_body;
 mod utils;
 mod world;
 
-use rigid_body::{ColliderShape, OBB};
+use rigid_body::ColliderShape;
 use world::World;
 
 use crate::utils::rand_vector3;
@@ -24,8 +26,18 @@ fn main() {
     let mut window = Window::new("Physics Engine Renderer");
     window.set_light(Light::StickToCamera);
 
-    let mut world = World::initialize_world();
-    for _ in 0..50 {
+    let mut world = World::initialize_world([75., 75., 75.], 2000.);
+    for _ in 0..150 {
+        world.spawn_water_molecule(
+            2.,
+            1.,
+            5.,
+            rand_vector3(-35., 35.),
+            UnitQuaternion::new(rand_vector3(-80., 80.)),
+            rand_vector3(-30., 30.),
+            rand_vector3(-10., 10.),
+        );
+        /*
         world.spawn_test_sphere(3., 1., rand_vector3(-50., 50.), rand_vector3(-5., 5.));
         world.spawn_test_box(
             10.,
@@ -37,11 +49,7 @@ fn main() {
             rand_vector3(-5., 5.),
             rand_vector3(-0.5, 0.5),
         );
-    }
-
-    println!("Number of colliders: {}", world.colliders.len());
-    for (id, collider) in &world.colliders {
-        println!("Collider {id}: {:?}", collider.shape);
+         */
     }
 
     // Track SceneNode per Collider ID
@@ -69,17 +77,6 @@ fn main() {
 
         nodes.insert(*id, node);
     }
-
-    println!("Total SceneNodes: {}", nodes.len());
-    for (id, node) in &nodes {
-        println!("Node {id} exists");
-    }
-
-    println!("Collider 9 position: {:?}", world.obbs.get(&9).unwrap().global_pos);
-    println!("Collider 9 orientation: {:?}", world.obbs.get(&9).unwrap().global_orientation);
-    println!("Collider 10 position: {:?}", world.obbs.get(&10).unwrap().global_pos);
-    println!("Collider 10 orientation: {:?}", world.obbs.get(&10).unwrap().global_orientation);
-
     // Simulation/rendering loop
     while window.render() {
         world.step();

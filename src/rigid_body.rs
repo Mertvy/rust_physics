@@ -1,16 +1,16 @@
 extern crate nalgebra as na;
 use crate::{
-    broadphase::{self, BroadPhase, NSquared, Ray3},
-    rigid_body,
+    broadphase::Ray3,
     utils::safe_normalize,
-    world::{ColliderMap, OBBMap, RigidBodyMap},
+    world::{ColliderMap, RigidBodyMap},
 };
 use core::f32;
-use na::{Matrix3, UnitQuaternion, UnitVector3, Vector3};
+use na::{Matrix3, UnitQuaternion, Vector3};
 use std::array;
 
 type ArrayList<T> = Vec<T>;
 
+#[derive(Debug, Clone)]
 pub struct RigidBody {
     pub id: usize,
     pub mass: f32,
@@ -264,7 +264,7 @@ impl OBB {
         let rigid_body = rigid_bodies.get(&collider.body_id).expect("Collider has no body");
 
         self.global_pos = rigid_body.local_to_global_pos(&collider.local_center_mass);
-        self.global_orientation = collider.local_orientation * rigid_body.global_orientation;
+        self.global_orientation = rigid_body.global_orientation * collider.local_orientation;
 
         match &collider.shape {
             ColliderShape::Box { x_len, y_len, z_len } => {
@@ -367,8 +367,8 @@ impl OBB {
 
 pub struct AABB {
     pub collider_id: usize,
-    global_min: Vector3<f32>,
-    global_max: Vector3<f32>,
+    pub global_min: Vector3<f32>,
+    pub global_max: Vector3<f32>,
 }
 
 impl AABB {

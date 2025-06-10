@@ -5,6 +5,7 @@ use crate::{
 };
 use core::f32;
 use na::{UnitVector3, Vector3};
+use std::collections::{HashMap, HashSet};
 use std::usize;
 
 pub type ArrayList<T> = Vec<T>;
@@ -113,5 +114,77 @@ impl BroadPhase for NSquared {
             result.normal = normal;
         }
         return result;
+    }
+}
+
+fn world_to_cell(pos: &Vector3<f32>, cell_size: f32) -> (i32, i32, i32) {
+    (
+        (pos.x / cell_size).floor() as i32,
+        (pos.y / cell_size).floor() as i32,
+        (pos.z / cell_size).floor() as i32,
+    )
+}
+
+pub struct SpatialHashing {
+    cell_size: f32,
+    spatial_map: HashMap<(i32, i32, i32), Vec<usize>>,
+}
+
+impl SpatialHashing {
+    pub fn new(cell_size: f32) -> Self {
+        Self { cell_size, spatial_map: HashMap::new() }
+    }
+}
+
+impl BroadPhase for SpatialHashing {
+    fn update(&mut self, colliders: &ColliderMap, obbs: &OBBMap) {
+        self.spatial_map.clear();
+
+        for (collider_id, collider) in colliders {
+            let aabb = AABB::new_from_obb(*collider_id, &obbs[&collider.obb_id]);
+            let min = world_to_cell(&aabb.global_min, self.cell_size);
+            let max = world_to_cell(&aabb.global_max, self.cell_size);
+
+            for x in min.0..=max.0 {
+                for y in min.1..=max.1 {
+                    for z in min.2..=max.2 {
+                        self.spatial_map.entry((x, y, z)).or_default().push(*collider_id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn query_potential_collisions(&self) -> ArrayList<ColliderPair> {
+        let mut pair_set = HashSet::new();
+        let mut pairs = ArrayList::new();
+        for cell_contents in self.spatial_map.values() {
+            for i in 0..cell_contents.len() {
+                for j in (i + 1)..cell_contents.len() {
+                    let id1 = cell_contents[i];
+                    let id2 = cell_contents[j];
+                    let key = (id1.min(id2), id1.max(id2));
+                    if pair_set.insert(key) {
+                        pairs.push(ColliderPair(id1, id2));
+                    }
+                }
+            }
+        }
+
+        return pairs;
+    }
+
+    fn add(&mut self, aabb: AABB) {}
+
+    fn query_aabb(&self, aabb: &AABB) -> ArrayList<usize> {
+        todo!();
+    }
+
+    fn query_point(&self, point: &Vector3<f32>) -> Option<usize> {
+        todo!()
+    }
+
+    fn query_ray(&self, ray: &Ray3, colliders: &ColliderMap) -> RayCastResult {
+        todo!()
     }
 }

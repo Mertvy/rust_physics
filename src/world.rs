@@ -1,11 +1,15 @@
+use core::f32;
+use std::collections::HashMap;
+use std::time::Instant;
+
 use nalgebra::{ArrayStorage, Matrix3, U12, UnitQuaternion, Vector, Vector3};
 
-use crate::broadphase::{ArrayList, BroadPhase, ColliderPair, NSquared};
+use rayon::prelude::*;
+
+use crate::broadphase::{ArrayList, BroadPhase, ColliderPair, SpatialHashing};
 use crate::collision::{Contact, expanding_polytope, gjk};
 use crate::constraint::VelocityConstraint;
 use crate::rigid_body::{AABB, Collider, ColliderShape, OBB, RigidBody};
-use core::f32;
-use std::collections::HashMap;
 
 pub type RigidBodyMap = HashMap<usize, RigidBody>;
 pub type ColliderMap = HashMap<usize, Collider>;
@@ -24,12 +28,18 @@ pub struct World {
     pub obbs: OBBMap,
     next_obb_id: usize,
 
-    broadphase: NSquared,
+    broadphase: SpatialHashing,
+
+    temperature: f32,
 }
 
 impl World {
     pub fn step(&mut self) {
-        self.apply_gravity();
+        //self.apply_gravity();
+
+        let timer = Instant::now();
+
+        self.apply_thermostat(self.temperature);
 
         let contacts = self.generate_contacts();
 
@@ -38,6 +48,8 @@ impl World {
         self.solve_velocity_constraints(contacts, &velocity_constraints);
 
         self.update_world();
+
+        println!("step took: {:.2?}", timer.elapsed());
     }
 
     fn apply_gravity(&mut self) {
@@ -46,30 +58,67 @@ impl World {
         }
     }
 
+    fn apply_thermostat(&mut self, target_temp: f32) {
+        let mut total_ke = 0.0;
+        let mut dof = 0;
+
+        for body in self.rigid_bodies.values() {
+            if body.is_static {
+                continue;
+            }
+
+            let mass = 1.0 / body.inv_mass;
+            total_ke += 0.5 * mass * body.lin_velocity.norm_squared();
+            dof += 3;
+
+            let I = body.global_inv_moment_inertia.try_inverse().unwrap_or(Matrix3::identity());
+            total_ke += 0.5 * (body.ang_velocity.transpose() * I * body.ang_velocity)[0];
+            dof += 3;
+        }
+
+        let current_temp = total_ke / (dof as f32);
+        let scale = f32::min((target_temp / current_temp).sqrt(), 1.5);
+
+        if scale.is_nan() {
+            panic!()
+        }
+        for body in self.rigid_bodies.values_mut() {
+            if body.is_static {
+                continue;
+            }
+
+            body.lin_velocity *= scale;
+            body.ang_velocity *= scale;
+        }
+    }
+
     fn generate_contacts(&self) -> ArrayList<Contact> {
-        let mut contacts = ArrayList::new();
-        for ColliderPair(collider_id1, collider_id2) in self.broadphase.query_potential_collisions()
-        {
-            let collider1 =
-                self.colliders.get(&collider_id1).expect("Erm... the collider aint here");
-            let collider2 =
-                self.colliders.get(&collider_id2).expect("Erm... the collider aint here");
+        return self
+            .broadphase
+            .query_potential_collisions()
+            .par_iter()
+            .filter_map(|pair| {
+                let collider1 = &self.colliders.get(&pair.0).expect("Collider doesn't exist");
+                let collider2 = &self.colliders.get(&pair.1).expect("Collider doesn't exist");
 
-            if collider1.body_id == collider2.body_id {
-                continue;
-            }
+                if collider1.body_id == collider2.body_id {
+                    return None;
+                }
 
-            /*
-            let obb1 = self.obbs.get(&collider1.obb_id).expect("Collider has no OBB");
-            let obb2 = self.obbs.get(&collider2.obb_id).expect("Collider has no OBB");
+                /*
+                let obb1 = self.obbs.get(&collider1.obb_id).expect("Collider has no OBB");
+                let obb2 = self.obbs.get(&collider2.obb_id).expect("Collider has no OBB");
 
-            if !obb1.collides(obb2) {
-                continue;
-            }
-            */
+                if !obb1.collides(obb2) {
+                    continue;
+                }
+                */
 
-            let (is_colliding, simplex) = gjk(collider1, collider2, &self.rigid_bodies);
-            if is_colliding {
+                let (is_colliding, simplex) = gjk(collider1, collider2, &self.rigid_bodies);
+                if !is_colliding {
+                    return None;
+                }
+
                 let body1 = self
                     .rigid_bodies
                     .get(&collider1.body_id)
@@ -80,14 +129,14 @@ impl World {
                     .expect("Collider doesn't belong to body");
 
                 if f32::is_nan(simplex[0].minkowski.x) {
-                    continue;
+                    return None;
                 }
 
-                match expanding_polytope(simplex, collider1, collider2, &self.rigid_bodies) {
+                match expanding_polytope(simplex, &collider1, &collider2, &self.rigid_bodies) {
                     Some((collision_normal, penetration_depth, collision_surface_points)) => {
                         let mean_collision_point =
                             (collision_surface_points.0 + collision_surface_points.1) / 2.;
-                        contacts.push(Contact::build_contact(
+                        return Some(Contact::build_contact(
                             body1,
                             body2,
                             mean_collision_point,
@@ -95,48 +144,48 @@ impl World {
                             penetration_depth,
                         ));
                     }
-                    None => continue,
+                    None => return None,
                 }
-            }
-        }
-        return contacts;
+            })
+            .collect();
     }
 
     fn generate_velocity_constraints(
         &self,
         contacts: &ArrayList<Contact>,
     ) -> ArrayList<VelocityConstraint> {
-        let mut vel_constraints = ArrayList::with_capacity(3 * contacts.len());
-        for contact in contacts {
-            let (pen_jacobian, pen_bias) = contact.compute_normal_jacobian_bias(dt);
-            vel_constraints.push(VelocityConstraint {
-                body_id1: contact.body_id1,
-                body_id2: contact.body_id2,
+        return contacts
+            .par_iter()
+            .flat_map_iter(|contact| {
+                let (pen_jacobian, pen_bias) = contact.compute_normal_jacobian_bias(dt);
+                let norm_constraint = VelocityConstraint {
+                    body_id1: contact.body_id1,
+                    body_id2: contact.body_id2,
 
-                jacobian: pen_jacobian,
-                b: pen_bias,
-            });
+                    jacobian: pen_jacobian,
+                    b: pen_bias,
+                };
 
-            let (fric_jacobian1, fric_jacobian2) = contact.compute_friction_jacobians();
+                let (fric_jacobian1, fric_jacobian2) = contact.compute_friction_jacobians();
+                let fric_constraint1 = VelocityConstraint {
+                    body_id1: contact.body_id1,
+                    body_id2: contact.body_id2,
 
-            vel_constraints.push(VelocityConstraint {
-                body_id1: contact.body_id1,
-                body_id2: contact.body_id2,
+                    jacobian: fric_jacobian1,
+                    b: 0.,
+                };
 
-                jacobian: fric_jacobian1,
-                b: 0.,
-            });
+                let fric_constraint2 = VelocityConstraint {
+                    body_id1: contact.body_id1,
+                    body_id2: contact.body_id2,
 
-            vel_constraints.push(VelocityConstraint {
-                body_id1: contact.body_id1,
-                body_id2: contact.body_id2,
+                    jacobian: fric_jacobian2,
+                    b: 0.,
+                };
 
-                jacobian: fric_jacobian2,
-                b: 0.,
-            });
-        }
-
-        return vel_constraints;
+                return vec![norm_constraint, fric_constraint1, fric_constraint2];
+            })
+            .collect();
     }
 
     fn apply_impulse(&mut self, dv: Vector<f32, U12, ArrayStorage<f32, 12, 1>>, contact: &Contact) {
@@ -266,7 +315,7 @@ impl World {
             shape: ColliderShape::Box {
                 x_len: (box_dimensions[0]),
                 y_len: (box_dimensions[1]),
-                z_len: (1.),
+                z_len: (3.),
             },
             mass: f32::INFINITY,
             local_center_mass: Vector3::new(0., 0., -box_dimensions[2] / 2.),
@@ -277,7 +326,7 @@ impl World {
             shape: ColliderShape::Box {
                 x_len: (box_dimensions[0]),
                 y_len: (box_dimensions[1]),
-                z_len: (1.),
+                z_len: (3.),
             },
             mass: f32::INFINITY,
             local_center_mass: Vector3::new(0., 0., box_dimensions[2] / 2.),
@@ -287,7 +336,7 @@ impl World {
         let left_wall_data = ColliderData {
             shape: ColliderShape::Box {
                 x_len: (box_dimensions[0]),
-                y_len: (1.),
+                y_len: (3.),
                 z_len: (box_dimensions[2]),
             },
             mass: f32::INFINITY,
@@ -298,7 +347,7 @@ impl World {
         let right_wall_data = ColliderData {
             shape: ColliderShape::Box {
                 x_len: (box_dimensions[0]),
-                y_len: (1.),
+                y_len: (3.),
                 z_len: (box_dimensions[2]),
             },
             mass: f32::INFINITY,
@@ -308,7 +357,7 @@ impl World {
 
         let front_wall_data = ColliderData {
             shape: ColliderShape::Box {
-                x_len: (1.),
+                x_len: (3.),
                 y_len: (box_dimensions[1]),
                 z_len: (box_dimensions[2]),
             },
@@ -319,7 +368,7 @@ impl World {
 
         let back_wall_data = ColliderData {
             shape: ColliderShape::Box {
-                x_len: (1.),
+                x_len: (3.),
                 y_len: (box_dimensions[1]),
                 z_len: (box_dimensions[2]),
             },
@@ -345,7 +394,7 @@ impl World {
         );
     }
 
-    pub fn initialize_world() -> World {
+    pub fn initialize_world(box_dimensions: [f32; 3], temperature: f32) -> World {
         let mut world = World {
             rigid_bodies: HashMap::new(),
             next_body_id: 0,
@@ -353,10 +402,11 @@ impl World {
             next_collider_id: 0,
             obbs: HashMap::new(),
             next_obb_id: 0,
-            broadphase: NSquared { aabb_list: ArrayList::new() },
+            broadphase: SpatialHashing::new(7.5),
+            temperature: temperature,
         };
 
-        world.construct_world_box([100., 100., 100.]);
+        world.construct_world_box(box_dimensions);
 
         return world;
     }
