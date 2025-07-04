@@ -10,7 +10,6 @@ use std::array;
 
 type ArrayList<T> = Vec<T>;
 
-#[derive(Debug, Clone)]
 pub struct RigidBody {
     pub id: usize,
     pub mass: f32,
@@ -61,6 +60,10 @@ impl RigidBody {
 
             is_static: is_static,
         };
+    }
+
+    pub fn dummy() -> RigidBody {
+        return Self::new_body(usize::MAX, Vector3::zeros(), UnitQuaternion::identity(), true);
     }
 
     pub fn update(&mut self, dt: f32) {

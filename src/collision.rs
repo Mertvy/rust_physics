@@ -604,7 +604,7 @@ impl Contact {
             tangent_impulse_sum1: 0.,
             tangent_impulse_sum2: 0.,
 
-            coeff_friction: 0.1,
+            coeff_friction: 0.2,
         };
     }
 
@@ -628,7 +628,7 @@ impl Contact {
             + self.ang_velocity2.cross(&r2))
         .dot(&self.normal);
 
-        let restitution_coeff = 0.75; // Tunable 
+        let restitution_coeff = 0.5; // Tunable 
         let restitution_bias = if rel_velocity < -1e-2 && self.penetration_depth > 1e-3 {
             restitution_coeff
                 * (-self.lin_velocity1 - self.ang_velocity1.cross(&r1)

@@ -1,7 +1,7 @@
 use na::Vector3;
 use nalgebra::{ArrayStorage, Matrix3, RowVector, SMatrix, U12, Vector};
 
-use crate::world::RigidBodyMap;
+use crate::{rigid_body::RigidBody, world::RigidBodyMap};
 
 extern crate nalgebra as na;
 
@@ -61,5 +61,35 @@ impl VelocityConstraint {
             / (self.jacobian * unscaled_velocity_reponse)[0];
 
         return (l, unscaled_velocity_reponse);
+    }
+
+    pub fn compute_constraint_raw(
+        &self,
+        body_ptr1: *mut RigidBody,
+        body_ptr2: *mut RigidBody,
+    ) -> (f32, Vector<f32, U12, ArrayStorage<f32, 12, 1>>) {
+        unsafe {
+            let velocities = build_velocities([
+                (*body_ptr1).lin_velocity,
+                (*body_ptr1).ang_velocity,
+                (*body_ptr2).lin_velocity,
+                (*body_ptr2).ang_velocity,
+            ]);
+
+            let M_inv1 = Matrix3::identity() * (*body_ptr1).inv_mass;
+            let M_inv2 = Matrix3::identity() * (*body_ptr2).inv_mass;
+            let M_inv = block_diag_4x3x3([
+                &M_inv1,
+                &(*body_ptr1).global_inv_moment_inertia,
+                &M_inv2,
+                &(*body_ptr2).global_inv_moment_inertia,
+            ]);
+
+            let unscaled_velocity_reponse = M_inv * self.jacobian.transpose();
+            let l = -((self.jacobian * velocities)[0] + self.b)
+                / (self.jacobian * unscaled_velocity_reponse)[0];
+
+            return (l, unscaled_velocity_reponse);
+        }
     }
 }

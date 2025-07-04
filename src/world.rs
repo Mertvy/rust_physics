@@ -1,22 +1,25 @@
 use core::f32;
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
+
 use std::time::Instant;
 
 use nalgebra::{ArrayStorage, Matrix3, U12, UnitQuaternion, Vector, Vector3};
 
 use rayon::prelude::*;
 
-use crate::broadphase::{ArrayList, BroadPhase, ColliderPair, SpatialHashing};
+use crate::broadphase::{ArrayList, BroadPhase, SpatialHashing};
 use crate::collision::{Contact, expanding_polytope, gjk};
 use crate::constraint::VelocityConstraint;
 use crate::rigid_body::{AABB, Collider, ColliderShape, OBB, RigidBody};
+use crate::utils::UnionFind;
 
 pub type RigidBodyMap = HashMap<usize, RigidBody>;
 pub type ColliderMap = HashMap<usize, Collider>;
 pub type OBBMap = HashMap<usize, OBB>;
 
 const dt: f32 = 1. / 60.;
-const GRAVITY: Vector3<f32> = Vector3::new(0., -30., 0.);
+const GRAVITY: Vector3<f32> = Vector3::new(10., 0., 0.);
 
 pub struct World {
     pub rigid_bodies: RigidBodyMap,
@@ -41,15 +44,33 @@ impl World {
 
         self.apply_thermostat(self.temperature);
 
+        let thermostat_time = timer.elapsed();
+
         let contacts = self.generate_contacts();
+
+        let contacts_time = timer.elapsed();
 
         let velocity_constraints = self.generate_velocity_constraints(&contacts);
 
-        self.solve_velocity_constraints(contacts, &velocity_constraints);
+        let constraints_init_time = timer.elapsed();
+
+        self.solve_velocity_constraints_parallel(contacts, &velocity_constraints);
+
+        let constraints_solve_time = timer.elapsed();
 
         self.update_world();
 
-        println!("step took: {:.2?}", timer.elapsed());
+        let update_time = timer.elapsed();
+
+        println!(
+            "Time of step: {:.2?}, applying thermostat {:.2?}, generating contacts: {:.2?}, generating constraints: {:.2?}, solving constraints {:.2?}, integration: {:.2?}",
+            timer.elapsed(),
+            thermostat_time,
+            contacts_time - thermostat_time,
+            constraints_init_time - contacts_time,
+            constraints_solve_time - constraints_init_time,
+            update_time - constraints_solve_time
+        );
     }
 
     fn apply_gravity(&mut self) {
@@ -62,9 +83,14 @@ impl World {
         let mut total_ke = 0.0;
         let mut dof = 0;
 
-        for body in self.rigid_bodies.values() {
+        for body in self.rigid_bodies.values_mut() {
             if body.is_static {
                 continue;
+            }
+
+            if body.global_center_mass.norm_squared() > 10_000. {
+                body.lin_velocity = Vector3::zeros();
+                body.ang_velocity = Vector3::zeros();
             }
 
             let mass = 1.0 / body.inv_mass;
@@ -204,6 +230,129 @@ impl World {
         }
     }
 
+    fn apply_impulse_to_bodies(
+        body1: &mut RigidBody,
+        body2: &mut RigidBody,
+        dv: Vector<f32, U12, ArrayStorage<f32, 12, 1>>,
+    ) {
+        if !body1.is_static {
+            body1.lin_velocity += Vector3::new(dv[0], dv[1], dv[2]);
+            body1.ang_velocity += Vector3::new(dv[3], dv[4], dv[5]);
+        }
+
+        if !body2.is_static {
+            body2.lin_velocity += Vector3::new(dv[6], dv[7], dv[8]);
+            body2.ang_velocity += Vector3::new(dv[9], dv[10], dv[11]);
+        }
+    }
+
+    fn solve_velocity_constraints_parallel(
+        &mut self,
+        mut contacts: ArrayList<Contact>,
+        constraints: &ArrayList<VelocityConstraint>,
+    ) {
+        let mut constraints_map: HashMap<(usize, usize), ArrayList<&VelocityConstraint>> =
+            HashMap::new();
+
+        for constraint in constraints {
+            let key = (constraint.body_id1, constraint.body_id2);
+
+            constraints_map.entry(key).or_default().push(constraint);
+        }
+
+        let mut islands = UnionFind::new(self.rigid_bodies.len());
+        for contact in &contacts {
+            islands.union(contact.body_id1, contact.body_id2);
+        }
+
+        let mut islands_map: HashMap<usize, ArrayList<Contact>> = HashMap::new();
+        for contact in contacts {
+            let root = islands.find(contact.body_id1);
+
+            islands_map.entry(root).or_default().push(contact);
+        }
+
+        let mut per_island_contacts: ArrayList<(usize, ArrayList<Contact>)> = ArrayList::new();
+        for (rep_id, contact_list) in islands_map.into_iter() {
+            per_island_contacts.push((rep_id, contact_list));
+        }
+
+        let mut bodies_vec = ArrayList::with_capacity(self.next_body_id);
+        for _ in 0..self.next_body_id {
+            bodies_vec.push(None);
+        }
+
+        let old_bodies = std::mem::take(&mut self.rigid_bodies); // empties the original map
+        for (id, body) in old_bodies {
+            bodies_vec[id] = Some(ThreadUnsafeRigidBodyCell { cell: UnsafeCell::new(body) });
+        }
+        let mut shared_bodies = ThreadUnsafeRigidBodyVec { bodies: bodies_vec };
+
+        for _ in 0..20 {
+            per_island_contacts.par_iter_mut().for_each(|(_, contacts)| {
+                for contact in contacts {
+                    unsafe {
+                        let body1 = &mut *shared_bodies.bodies[contact.body_id1]
+                            .as_ref()
+                            .unwrap()
+                            .cell
+                            .get();
+                        let body2 = &mut *shared_bodies.bodies[contact.body_id2]
+                            .as_ref()
+                            .unwrap()
+                            .cell
+                            .get();
+
+                        let contact_constraints = constraints_map
+                            .get(&(contact.body_id1, contact.body_id2))
+                            .expect("Contact has no constraints");
+
+                        let (normal_constraint, tangential_constraint1, tangential_constraint2) = (
+                            contact_constraints[0],
+                            contact_constraints[1],
+                            contact_constraints[2],
+                        );
+
+                        let (delta_lambda, unscaled_velocity_response) =
+                            normal_constraint.compute_constraint_raw(body1, body2);
+                        let tmp = contact.normal_impulse_sum;
+                        contact.normal_impulse_sum = f32::max(0., tmp + delta_lambda);
+                        let clamped_delta_lambda = contact.normal_impulse_sum - tmp;
+                        let delta_velocity = clamped_delta_lambda * unscaled_velocity_response;
+                        Self::apply_impulse_to_bodies(body1, body2, delta_velocity);
+
+                        let max_friction_magnitude =
+                            contact.coeff_friction * contact.normal_impulse_sum;
+                        let (delta_lambda, unscaled_velocity_response) =
+                            tangential_constraint1.compute_constraint_raw(body1, body2);
+                        let tmp = contact.tangent_impulse_sum1;
+                        contact.tangent_impulse_sum1 = (tmp + delta_lambda)
+                            .clamp(-max_friction_magnitude, max_friction_magnitude);
+                        let clamped_delta_lambda = contact.tangent_impulse_sum1 - tmp;
+                        let delta_velocity = clamped_delta_lambda * unscaled_velocity_response;
+                        Self::apply_impulse_to_bodies(body1, body2, delta_velocity);
+
+                        let (delta_lambda, unscaled_velocity_response) =
+                            tangential_constraint2.compute_constraint_raw(body1, body2);
+                        let tmp = contact.tangent_impulse_sum2;
+                        contact.tangent_impulse_sum2 = (tmp + delta_lambda)
+                            .clamp(-max_friction_magnitude, max_friction_magnitude);
+                        let clamped_delta_lambda = contact.tangent_impulse_sum2 - tmp;
+                        let delta_velocity = clamped_delta_lambda * unscaled_velocity_response;
+                        Self::apply_impulse_to_bodies(body1, body2, delta_velocity);
+                    }
+                }
+            });
+        }
+
+        for i in 0..shared_bodies.bodies.len() {
+            if let Some(thread_unsafe_unsafe_cell) = shared_bodies.bodies[i].take() {
+                let raw_body = thread_unsafe_unsafe_cell.cell.into_inner();
+                self.rigid_bodies.insert(i, raw_body);
+            }
+        }
+    }
+
     fn solve_velocity_constraints(
         &mut self,
         mut contacts: ArrayList<Contact>,
@@ -311,11 +460,12 @@ impl World {
     }
 
     fn construct_world_box(&mut self, box_dimensions: [f32; 3]) {
+        let wall_width = 10.0;
         let bottom_wall_data = ColliderData {
             shape: ColliderShape::Box {
                 x_len: (box_dimensions[0]),
                 y_len: (box_dimensions[1]),
-                z_len: (3.),
+                z_len: (wall_width),
             },
             mass: f32::INFINITY,
             local_center_mass: Vector3::new(0., 0., -box_dimensions[2] / 2.),
@@ -326,7 +476,7 @@ impl World {
             shape: ColliderShape::Box {
                 x_len: (box_dimensions[0]),
                 y_len: (box_dimensions[1]),
-                z_len: (3.),
+                z_len: (wall_width),
             },
             mass: f32::INFINITY,
             local_center_mass: Vector3::new(0., 0., box_dimensions[2] / 2.),
@@ -336,7 +486,7 @@ impl World {
         let left_wall_data = ColliderData {
             shape: ColliderShape::Box {
                 x_len: (box_dimensions[0]),
-                y_len: (3.),
+                y_len: (wall_width),
                 z_len: (box_dimensions[2]),
             },
             mass: f32::INFINITY,
@@ -347,7 +497,7 @@ impl World {
         let right_wall_data = ColliderData {
             shape: ColliderShape::Box {
                 x_len: (box_dimensions[0]),
-                y_len: (3.),
+                y_len: (wall_width),
                 z_len: (box_dimensions[2]),
             },
             mass: f32::INFINITY,
@@ -357,7 +507,7 @@ impl World {
 
         let front_wall_data = ColliderData {
             shape: ColliderShape::Box {
-                x_len: (3.),
+                x_len: (wall_width),
                 y_len: (box_dimensions[1]),
                 z_len: (box_dimensions[2]),
             },
@@ -368,7 +518,7 @@ impl World {
 
         let back_wall_data = ColliderData {
             shape: ColliderShape::Box {
-                x_len: (3.),
+                x_len: (wall_width),
                 y_len: (box_dimensions[1]),
                 z_len: (box_dimensions[2]),
             },
@@ -525,3 +675,15 @@ struct ColliderData {
     local_center_mass: Vector3<f32>,
     local_orientation: UnitQuaternion<f32>,
 }
+
+struct ThreadUnsafeRigidBodyVec {
+    bodies: ArrayList<Option<ThreadUnsafeRigidBodyCell>>,
+}
+
+unsafe impl Sync for ThreadUnsafeRigidBodyVec {}
+
+struct ThreadUnsafeRigidBodyCell {
+    cell: UnsafeCell<RigidBody>,
+}
+
+unsafe impl Sync for ThreadUnsafeRigidBodyCell {}

@@ -5,9 +5,7 @@ use kiss3d::light::Light;
 use kiss3d::scene::SceneNode;
 use kiss3d::window::Window;
 
-use rayon;
-
-use na::{Translation3, UnitQuaternion};
+use na::{Translation3, UnitQuaternion, Vector3};
 use std::collections::HashMap;
 
 mod broadphase;
@@ -26,8 +24,8 @@ fn main() {
     let mut window = Window::new("Physics Engine Renderer");
     window.set_light(Light::StickToCamera);
 
-    let mut world = World::initialize_world([75., 75., 75.], 2000.);
-    for _ in 0..150 {
+    let mut world = World::initialize_world([75., 75., 75.], 1000.);
+    for _ in 0..50 {
         world.spawn_water_molecule(
             2.,
             1.,
@@ -37,19 +35,6 @@ fn main() {
             rand_vector3(-30., 30.),
             rand_vector3(-10., 10.),
         );
-        /*
-        world.spawn_test_sphere(3., 1., rand_vector3(-50., 50.), rand_vector3(-5., 5.));
-        world.spawn_test_box(
-            10.,
-            7.,
-            5.,
-            2.,
-            rand_vector3(-50., 50.),
-            UnitQuaternion::new(rand_vector3(-10., 10.)),
-            rand_vector3(-5., 5.),
-            rand_vector3(-0.5, 0.5),
-        );
-         */
     }
 
     // Track SceneNode per Collider ID
@@ -88,5 +73,6 @@ fn main() {
                 node.set_local_rotation(obb.global_orientation);
             }
         }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
